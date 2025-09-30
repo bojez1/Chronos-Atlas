@@ -1,34 +1,78 @@
-# ChronosAtlas – Dev Environment Setup (Phase 1 Alignment)
+# ChronosAtlas – Professional Development Environment Setup
 
-This document consolidates the Django + PostgreSQL containerized development environment, aligned with the **Chronos-Atlas blueprint** and leaving room for future phases (Celery/Redis, observability, scaling).
+This document provides a comprehensive guide to setting up and running the ChronosAtlas development environment. The setup uses Docker and Docker Compose to ensure consistency and reliability.
 
 ---
 
-## 1. Dockerfile
+## 1. Multi-Stage Dockerfile
+
+We use a multi-stage `Dockerfile` to create optimized images. The `builder` stage installs dependencies and builds Python wheels, while the `final` stage creates a minimal runtime image, resulting in smaller image sizes and improved security.
 
 ```dockerfile
-FROM python:3.11-slim
+# --- STAGE 1: Builder (Optimized for Dependency Installation) ---
+    FROM python:3.11-slim as builder
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
-
-# System dependencies for psycopg2 and other libs
-RUN apt-get update \
-    && apt-get install -y build-essential libpq-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --upgrade pip \
-    && pip install -r requirements.txt
-
-COPY . .
-
-EXPOSE 8000
-
-ENTRYPOINT ["/app/entrypoint.sh"]
+    # Set environment variables for Python optimization
+    ENV PYTHONDONTWRITEBYTECODE 1
+    ENV PYTHONUNBUFFERED 1
+    
+    # Install system dependencies and build tools needed for psycopg2
+    RUN apt-get update \
+        && apt-get install --no-install-recommends -y \
+        gcc \
+        libpq-dev \
+        # Install dependencies needed for static files (if any)
+        # and clean up in a single layer
+        && pip install --upgrade pip
+    
+    # Set the working directory
+    WORKDIR /app
+    
+    # Copy requirements file and install Python dependencies
+    COPY requirements.txt .
+    
+    # Install dependencies and then remove build tools to keep the layer lean
+    RUN pip wheel --no-cache-dir --no-deps --wheel-dir /usr/src/app/wheels -r requirements.txt \
+        && apt-get purge -y --auto-remove gcc libpq-dev
+    
+    # --- STAGE 2: Final (Minimal Runtime Image) ---
+    FROM python:3.11-slim as final
+    
+    # Set environment variables
+    ENV PYTHONDONTWRITEBYTECODE 1
+    ENV PYTHONUNBUFFERED 1
+    
+    # Set the working directory
+    WORKDIR /app
+    
+    # Install runtime dependencies (libpq-dev dependencies without the dev headers)
+    # FIX: Added 'postgresql-client' here, which provides the 'pg_isready' command
+    RUN apt-get update \
+        && apt-get install --no-install-recommends -y \
+        libpq5 \
+        postgresql-client \
+        # Clean up APT cache to reduce image size
+        && rm -rf /var/lib/apt/lists/*
+    
+    # Copy pre-built wheels from the builder stage
+    COPY --from=builder /usr/src/app/wheels /wheels
+    # Install packages from wheels
+    RUN pip install --no-cache-dir /wheels/*
+    
+    # Copy the rest of the application code
+    COPY . /app
+    
+    # Ensure entrypoint.sh is executable and copy it to the bin directory
+    # Note: The entrypoint script path must match the ENTRYPOINT instruction below.
+    COPY scripts/entrypoint.sh /usr/local/bin/entrypoint.sh
+    RUN chmod +x /usr/local/bin/entrypoint.sh
+    
+    # Expose the application port
+    EXPOSE 8000
+    
+    # Specify the default command to run the application
+    # Use the correct path for the entrypoint script
+    ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
 
 ---
@@ -193,8 +237,33 @@ DB_PORT=5432
 
 ---
 
+## 7. Common Development Tasks
+
+### Checking Logs
+
+Since the development server runs in detached (`-d`) mode, you can use the `docker compose logs` command to view its output.
+
+**1. View all logs at once:**
+To see a snapshot of logs from all services (`api` and `db`):
+```bash
+docker compose -f docker-compose.dev.yml logs
+```
+
+**2. Follow logs in real-time (most common):**
+To stream logs live as they happen, use the `-f` or `--follow` flag. This is the best way to monitor your application.
+```bash
+docker compose -f docker-compose.dev.yml logs -f
+```
+*(Press `Ctrl+C` to stop streaming.)*
+
+**3. View logs for a specific service:**
+If you only need to see the logs from the Django `api` container:
+```bash
+docker compose -f docker-compose.dev.yml logs -f api
+```
+
+---
+
 ## ✅ Summary
 
-- **Phase 1 (Foundation)** → Django + Postgres are fully containerized and ready for development.  
-- **Phase 2 (MVP)** → Redis & Celery placeholders already exist in docker-compose and requirements, so future work won’t conflict.  
-- **Phase 3 (Production)** → Entrypoint script is extendable (can add gunicorn, monitoring, etc.).  
+This setup provides a robust, containerized environment that mirrors a production deployment while offering the flexibility needed for local development, such as hot-reloading.
